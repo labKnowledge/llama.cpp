@@ -139,7 +139,8 @@ class GGMLFileType(enum.IntEnum):
         dt = GGML_FILE_TYPE_TO_DATA_TYPE.get(self)
         if dt is None:
             raise ValueError(self)
-        # 1D tensors are always F32.
+        # Convert all 1D tensors to F32.  Most of the codebase that takes in 1D tensors only handles F32 tensors, and most of the outputs tensors are F32.
+        #  Also The 1d tensors aren't much of a performance/size issue.  So instead of having to have separate F32 and F16 implementations of both, just convert everything to F32 for now.
         return dt if len(tensor.shape) > 1 else DT_F32
 
 
@@ -828,6 +829,15 @@ def part_lazy(lazy_tensor: LazyTensor, n_part: int) -> LazyTensor:
     return LazyTensor(load, s, lazy_tensor.data_type, 'part ' + lazy_tensor.description)
 
 
+def pack_experts_lazy(lazy_tensors: list[LazyTensor]) -> LazyTensor:
+    def load() -> Tensor:
+        tensors = [lazy_tensor.load() for lazy_tensor in lazy_tensors]
+        return UnquantizedTensor(np.array([tensor.ndarray for tensor in tensors]))
+    s = lazy_tensors[0].shape.copy()
+    s.insert(0, len(lazy_tensors))
+    return LazyTensor(load, s, lazy_tensors[0].data_type, 'pack_experts ' + ' | '.join(lt.description for lt in lazy_tensors))
+
+
 # Functionality that simulates `torch.load` but where individual tensors are
 # only loaded into memory on demand, not all at once.
 # PyTorch can't do this natively as of time of writing:
@@ -1245,6 +1255,22 @@ def convert_model_names(model: LazyModel, params: Params, skip_unknown: bool) ->
     should_skip = set(gguf.MODEL_TENSOR_SKIP.get(ARCH, []))
 
     tmp = model
+
+    # merge experts into one tensor
+    if params.n_experts and params.n_experts > 0:
+        for i_l in range(params.n_layer):
+            for w in range(1, 4):
+                experts = []
+                for e in range(params.n_experts):
+                    if f"layers.{i_l}.feed_forward.experts.{e}.w{w}.weight" in model:
+                        experts.append(model[f"layers.{i_l}.feed_forward.experts.{e}.w{w}.weight"])
+                        del tmp[f"layers.{i_l}.feed_forward.experts.{e}.w{w}.weight"]
+                    elif f"model.layers.{i_l}.block_sparse_moe.experts.{e}.w{w}.weight" in model:
+                        experts.append(model[f"model.layers.{i_l}.block_sparse_moe.experts.{e}.w{w}.weight"])
+                        del tmp[f"model.layers.{i_l}.block_sparse_moe.experts.{e}.w{w}.weight"]
+                    else:
+                        raise ValueError(f"Expert tensor not found: layers.{i_l}.feed_forward.experts.{e}.w{w}.weight")
+                tmp[f"layers.{i_l}.feed_forward.experts.w{w}.weight"] = pack_experts_lazy(experts)
 
     # HF models permut or pack some of the tensors, so we need to undo that
     for i in itertools.count():
